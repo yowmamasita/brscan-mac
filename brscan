@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""brscan - scan from a Brother network scanner (brscan4-era, e.g. DCP-7055W) without Brother's drivers.
+
+Speaks Brother's scan protocol on TCP 54921 directly. Pure Python standard library, runs natively on
+Apple Silicon (no Rosetta). Output: PDF (multi-page), JPEG, PNG, TIFF, HEIC (non-PDF via macOS sips).
+
+  brscan --host scanner.local     # colour, 300 dpi, A4 -> ./scan-YYYYmmdd-HHMMSS.pdf
+  brscan --host scanner.local -m gray -r 200 hw.pdf
+  brscan --host scanner.local -m bw -r 300 doc.png
+  brscan --host scanner.local -n 3 book.pdf  # prompts between flatbed pages
+  brscan --host scanner.local --info          # show scanner status and scan area
+"""
+import argparse
+import datetime
+import os
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import zlib
+
+VERSION = "0.1.0"
+PORT = 54921
+MODES = {"color": ("CGRAY", "JPEG"), "gray": ("GRAY64", "RLENGTH"), "bw": ("TEXT", "RLENGTH")}
+SIZES_MM = {"a4": (210, 297), "letter": (216, 279), "a5": (148, 210), "full": (999, 999)}
+RESOLUTIONS = (100, 150, 200, 300, 600, 1200)
+OUTPUT_FORMATS = {"pdf", "jpg", "jpeg", "png", "tif", "tiff", "heic"}
+MAX_GREETING_BYTES = 64
+MAX_PARAMETER_BYTES = 4096
+
+END_SCAN, END_PAGE, RAW, RLE, JPEG = 0x80, 0x82, 0x40, 0x42, 0x64
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+class ScanError(Exception):
+    pass
+
+
+def output_format(path):
+    """Return the normalized output format, treating a missing suffix as PDF."""
+    ext = os.path.splitext(path)[1].lower().lstrip(".") or "pdf"
+    if ext not in OUTPUT_FORMATS:
+        allowed = ", ".join(sorted(OUTPUT_FORMATS))
+        raise argparse.ArgumentTypeError(f"unsupported output format '.{ext}'; choose one of {allowed}")
+    return path
+
+
+def bounded_int(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 0 <= number <= 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
+    return number
+
+
+def positive_int(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def host_candidates(explicit_host, environ=None):
+    """Resolve configured hosts, keeping an explicit CLI host authoritative.
+
+    BRSCAN_HOST is preferred when --host is absent. BRSCAN_IP is a fallback only
+    for environment-based configuration; it is never tried after --host.
+    """
+    env = os.environ if environ is None else environ
+    if explicit_host is not None:
+        host = explicit_host.strip()
+        if not host:
+            raise ScanError("--host must not be empty")
+        return [host]
+
+    configured_host = env.get("BRSCAN_HOST", "").strip()
+    configured_ip = env.get("BRSCAN_IP", "").strip()
+    if configured_host:
+        hosts = [configured_host]
+        if configured_ip and configured_ip != configured_host:
+            hosts.append(configured_ip)
+        return hosts
+    if configured_ip:
+        return [configured_ip]
+    raise ScanError("scanner host is required; pass --host, set BRSCAN_HOST, or set BRSCAN_IP")
+
+
+# ----------------------------------------------------------------------------- protocol
+
+class Scanner:
+    def __init__(self, host, timeout=30, fallback_hosts=()):
+        self.host, self.timeout = host, timeout
+        self.fallback_hosts = tuple(fallback_hosts)
+        self.sock, self.buf = None, bytearray()
+
+    def connect(self):
+        self.close()
+        self.buf.clear()
+        candidates = list(dict.fromkeys([self.host, *self.fallback_hosts]))
+        errors = []
+        for h in candidates:
+            try:
+                self.sock = socket.create_connection((h, PORT), timeout=8)
+            except OSError as e:
+                errors.append(f"{h}: {e}")
+                self.close()
+                self.buf.clear()
+                continue
+            try:
+                self.sock.settimeout(self.timeout)
+            except OSError as exc:
+                self.close()
+                self.buf.clear()
+                raise ScanError(f"could not configure scanner connection: {exc}") from exc
+            try:
+                self._read_greeting()
+            except ScanError:
+                self.close()
+                self.buf.clear()
+                raise
+            return
+        detail = "; ".join(errors) or "no host candidates"
+        raise ScanError(f"cannot reach scanner on TCP {PORT}: {detail}")
+
+    def _read_greeting(self):
+        while b"\n" not in self.buf:
+            if len(self.buf) >= MAX_GREETING_BYTES:
+                raise ScanError("scanner greeting is too long or missing its newline")
+            try:
+                data = self.sock.recv(MAX_GREETING_BYTES - len(self.buf))
+            except OSError as exc:
+                raise ScanError(f"could not read scanner greeting: {exc}") from exc
+            if not data:
+                raise ScanError("scanner closed the connection before sending its greeting")
+            self.buf += data
+        end = self.buf.index(b"\n") + 1
+        hello = bytes(self.buf[:end])
+        del self.buf[:end]
+        if hello.startswith(b"-NG"):
+            message = hello.strip().decode(errors="replace")
+            raise ScanError(f"scanner busy ({message}); try again in a moment")
+        if not hello.startswith(b"+OK"):
+            raise ScanError(f"unexpected scanner greeting: {hello!r}")
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def send(self, cmd, params):
+        if self.sock is None:
+            raise ScanError("scanner is not connected")
+        body = "".join(f"{k}={v}\n" for k, v in params)
+        try:
+            self.sock.sendall(f"\x1b{cmd}\n{body}\x80".encode("latin-1"))
+        except OSError as exc:
+            raise ScanError(f"could not send scanner command: {exc}") from exc
+
+    def need(self, n):
+        if n < 0:
+            raise ScanError("invalid scanner response length")
+        if self.sock is None:
+            raise ScanError("scanner is not connected")
+        while len(self.buf) < n:
+            try:
+                d = self.sock.recv(65536)
+            except OSError as exc:
+                raise ScanError(f"could not read scanner data: {exc}") from exc
+            if not d:
+                raise ScanError("scanner closed the connection mid-scan")
+            self.buf += d
+
+    def take(self, n):
+        if n < 0:
+            raise ScanError("invalid scanner response length")
+        self.need(n)
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def negotiate(self, dpi, mode):
+        """-> (xdpi, ydpi, max_w_mm, max_w_px, max_h_mm, max_h_px)"""
+        self.send("I", [("R", f"{dpi},{dpi}"), ("M", mode), ("D", "SIN")])
+        head = self.take(3)
+        if head[0] != 0 or head[2] != 0:
+            raise ScanError(f"bad parameter reply: {head!r}")
+        length = head[1]
+        if not length or length > MAX_PARAMETER_BYTES:
+            raise ScanError(f"invalid parameter reply length: {length}")
+        payload = self.take(length).rstrip(b"\x00,")
+        try:
+            vals = [int(v) for v in payload.split(b",")]
+            xd, yd, _adf, wmm, wpx, hmm, hpx = vals[:7]
+        except (ValueError, IndexError) as exc:
+            raise ScanError(f"malformed parameter reply: {payload!r}") from exc
+        if min(xd, yd, wmm, wpx, hmm, hpx) <= 0:
+            raise ScanError(f"invalid scanner dimensions in parameter reply: {payload!r}")
+        return xd, yd, wmm, wpx, hmm, hpx
+
+    def scan_page(self, dpi, mode, comp, w, h, brightness, contrast, progress):
+        self.send("X", [("R", f"{dpi},{dpi}"), ("M", mode), ("C", comp), ("J", "MID"),
+                        ("B", brightness), ("N", contrast), ("A", f"0,0,{w},{h}"),
+                        ("D", "SIN"), ("G", "1"), ("L", "128")])
+        chunks, got = [], 0
+        while True:
+            kind = self.take(1)[0]
+            if kind == END_SCAN:
+                return chunks, True
+            if kind == END_PAGE:
+                marker = self.take(5)             # 03 00 <page:2> 84
+                if marker[:2] != b"\x03\x00" or marker[4] != 0x84:
+                    raise ScanError(f"malformed end-page marker: {marker!r}")
+                return chunks, False
+            if kind not in (RAW, RLE, JPEG):
+                raise ScanError(f"unknown chunk type 0x{kind:02x}")
+            hdr = self.take(11)                   # 9 more header bytes + 2-byte length
+            n = hdr[9] | hdr[10] << 8
+            if not n:
+                raise ScanError(f"empty image chunk of type 0x{kind:02x}")
+            chunks.append((kind, self.take(n)))
+            got += n
+            progress(got, len(chunks))
+
+
+def unpackbits(d):
+    """Decode PackBits data, raising ScanError for truncated runs."""
+    o, i = bytearray(), 0
+    while i < len(d):
+        n = d[i]
+        i += 1
+        if n < 128:
+            count = n + 1
+            if i + count > len(d):
+                raise ScanError("malformed PackBits literal run")
+            o += d[i:i + count]
+            i += n + 1
+        elif n > 128:
+            if i >= len(d):
+                raise ScanError("malformed PackBits repeat run")
+            o += bytes([d[i]]) * (257 - n)
+            i += 1
+    return bytes(o)
+
+
+# ----------------------------------------------------------------------------- images
+
+class Page:
+    """kind: 'jpeg' (colour DCT data) or 'gray'/'bw' (raw rows)."""
+
+    def __init__(self, kind, data, w, h, dpi):
+        if kind not in {"jpeg", "gray", "bw"}:
+            raise ScanError(f"unsupported page kind: {kind!r}")
+        if not all(isinstance(value, int) and value > 0 for value in (w, h, dpi)):
+            raise ScanError("invalid image dimensions or resolution")
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise ScanError("scanner returned empty image data")
+        if kind == "gray" and len(data) != w * h:
+            raise ScanError("greyscale image data does not match its dimensions")
+        if kind == "bw" and (w % 8 or len(data) != (w // 8) * h):
+            raise ScanError("black-and-white image data does not match its dimensions")
+        self.kind, self.data, self.w, self.h, self.dpi = kind, data, w, h, dpi
+
+
+def jpeg_size(b):
+    if not isinstance(b, (bytes, bytearray)):
+        raise ScanError("malformed JPEG image data")
+    if len(b) < 2 or b[:2] != b"\xff\xd8":
+        raise ScanError("malformed JPEG image (missing SOI marker)")
+    i = 2
+    while i < len(b):
+        if b[i] != 0xFF:
+            i += 1
+            continue
+        while i < len(b) and b[i] == 0xFF:
+            i += 1
+        if i >= len(b):
+            break
+        m = b[i]
+        i += 1
+        if m in (0xD8, 0xD9) or 0xD0 <= m <= 0xD7:
+            continue
+        if i + 2 > len(b):
+            raise ScanError("malformed JPEG segment length")
+        segment_length = struct.unpack(">H", b[i:i + 2])[0]
+        if segment_length < 2 or i + segment_length > len(b):
+            raise ScanError("truncated JPEG segment")
+        if m in (0xC0, 0xC1, 0xC2):
+            if segment_length < 7:
+                raise ScanError("malformed JPEG frame segment")
+            h, w = struct.unpack(">HH", b[i + 3:i + 7])
+            if not w or not h:
+                raise ScanError("JPEG has invalid dimensions")
+            return w, h
+        i += segment_length
+    raise ScanError("could not read JPEG size")
+
+
+def build_page(chunks, kind, w, dpi):
+    if not chunks:
+        raise ScanError("scanner sent no image data")
+    if kind not in MODES:
+        raise ScanError(f"unsupported scan mode: {kind!r}")
+    if not isinstance(w, int) or w <= 0 or not isinstance(dpi, int) or dpi <= 0:
+        raise ScanError("invalid scan dimensions or resolution")
+    if kind == "color":
+        if any(chunk_kind != JPEG for chunk_kind, _ in chunks):
+            raise ScanError("colour scan contained a non-JPEG image chunk")
+        data = b"".join(c for _, c in chunks)
+        if not data.endswith(b"\xff\xd9"):
+            raise ScanError("malformed JPEG image (missing EOI marker)")
+        pw, ph = jpeg_size(data)
+        return Page("jpeg", data, pw, ph, dpi)
+    if any(k not in (RAW, RLE) for k, _ in chunks):
+        raise ScanError("raw scan contained an unsupported image chunk")
+    rows = [unpackbits(c) if k == RLE else c for k, c in chunks]
+    if any(not row for row in rows):
+        raise ScanError("scanner returned an empty image row")
+    if kind == "gray":
+        rows = [r[:w].ljust(w, b"\xff") for r in rows]
+        return Page("gray", b"".join(rows), w, len(rows), dpi)
+    rb = min(len(r) for r in rows)               # bw: whole bytes per row, 1 = black
+    if not rb:
+        raise ScanError("scanner returned zero-width black-and-white rows")
+    if any(len(row) != rb for row in rows):
+        raise ScanError("black-and-white image rows have inconsistent lengths")
+    return Page("bw", b"".join(r[:rb] for r in rows), rb * 8, len(rows), dpi)
+
+
+def png_bytes(p):
+    if p.kind == "jpeg":
+        raise ScanError("cannot encode a JPEG page as PNG directly")
+    bpp, rb = (8, p.w) if p.kind == "gray" else (1, p.w // 8)
+    expected = rb * p.h
+    if len(p.data) != expected:
+        raise ScanError("image data does not match PNG dimensions")
+    data = p.data if p.kind == "gray" else bytes(255 - c for c in p.data)   # PNG: 0 = black
+    raw = b"".join(b"\x00" + data[y * rb:(y + 1) * rb] for y in range(p.h))
+
+    def ch(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    ppm = round(p.dpi / 0.0254)
+    return (b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", p.w, p.h, bpp, 0, 0, 0, 0))
+            + ch(b"pHYs", struct.pack(">IIB", ppm, ppm, 1)) + ch(b"IDAT", zlib.compress(raw, 6))
+            + ch(b"IEND", b""))
+
+
+def pdf_bytes(pages):
+    objs = []
+
+    def add(b):
+        objs.append(b)
+        return len(objs)
+    page_ids = []
+    pages_id = 2
+    add(b"")                                      # 1 catalog, filled later
+    add(b"")                                      # 2 pages, filled later
+    for n, p in enumerate(pages):
+        if p.kind == "jpeg":
+            img, extra = p.data, b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode"
+        elif p.kind == "gray":
+            img, extra = zlib.compress(p.data, 6), b"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode"
+        else:
+            img, extra = zlib.compress(p.data, 6), (b"/ColorSpace /DeviceGray /BitsPerComponent 1 "
+                                                    b"/Decode [1 0] /Filter /FlateDecode")
+        im = add(b"<< /Type /XObject /Subtype /Image /Width %d /Height %d " % (p.w, p.h) + extra
+                 + b" /Length %d >>\nstream\n" % len(img) + img + b"\nendstream")
+        pw, ph = p.w * 72.0 / p.dpi, p.h * 72.0 / p.dpi
+        cs = b"q %.2f 0 0 %.2f 0 0 cm /Im%d Do Q" % (pw, ph, n)
+        c = add(b"<< /Length %d >>\nstream\n" % len(cs) + cs + b"\nendstream")
+        page_ids.append(add(b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 %.2f %.2f] "
+                            b"/Resources << /XObject << /Im%d %d 0 R >> >> /Contents %d 0 R >>"
+                            % (pages_id, pw, ph, n, im, c)))
+    objs[0] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    objs[1] = (b"<< /Type /Pages /Kids [" + b" ".join(b"%d 0 R" % i for i in page_ids)
+               + b"] /Count %d >>" % len(page_ids))
+    out, offs = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"), []
+    for i, o in enumerate(objs, 1):
+        offs.append(len(out))
+        out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offs)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    return bytes(out)
+
+
+def save(pages, path):
+    ext = os.path.splitext(path)[1].lower().lstrip(".") or "pdf"
+    if ext not in OUTPUT_FORMATS:
+        raise ScanError(f"unsupported output format '.{ext}'")
+    if ext == "pdf":
+        try:
+            with open(path, "wb") as f:
+                f.write(pdf_bytes(pages))
+        except OSError as exc:
+            raise ScanError(f"could not write {path}: {exc}") from exc
+        return [path]
+    outs = []
+    base, _ = os.path.splitext(path)
+    for i, p in enumerate(pages):
+        dst = path if len(pages) == 1 else f"{base}-{i + 1}.{ext}"
+        native = (ext in ("jpg", "jpeg") and p.kind == "jpeg") or (ext == "png" and p.kind != "jpeg")
+        if native:
+            try:
+                with open(dst, "wb") as f:
+                    f.write(p.data if p.kind == "jpeg" else png_bytes(p))
+            except OSError as exc:
+                raise ScanError(f"could not write {dst}: {exc}") from exc
+        else:                                     # convert with macOS sips
+            fmt = {"jpg": "jpeg", "tif": "tiff"}.get(ext, ext)
+            source = p.data if p.kind == "jpeg" else png_bytes(p)
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".jpg" if p.kind == "jpeg" else ".png", delete=False) as t:
+                    t.write(source)
+            except OSError as exc:
+                raise ScanError(f"could not prepare .{ext} conversion: {exc}") from exc
+            try:
+                try:
+                    r = subprocess.run(["/usr/bin/sips", "-s", "format", fmt, t.name, "--out", dst],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                except OSError as exc:
+                    raise ScanError(f"macOS sips is required to write .{ext} files: {exc}") from exc
+                if r.returncode:
+                    detail = r.stderr.decode(errors="replace").strip() if r.stderr else "unknown conversion error"
+                    raise ScanError(f"sips could not write .{ext}: {detail}")
+            finally:
+                try:
+                    os.unlink(t.name)
+                except OSError:
+                    pass
+        outs.append(dst)
+    return outs
+
+
+# ----------------------------------------------------------------------------- main
+
+def scan_one(args, page_no):
+    mode, comp = MODES[args.mode]
+    sc = Scanner(args.host, fallback_hosts=getattr(args, "fallback_hosts", ()))
+    sc.connect()
+    try:
+        xd, yd, wmm, wpx, hmm, hpx = sc.negotiate(args.resolution, mode)
+        if xd != args.resolution:
+            log(f"note: scanner uses {xd} dpi instead of {args.resolution}")
+        smm = SIZES_MM[args.size]
+        w = min(wpx, round(smm[0] / 25.4 * xd))
+        h = min(hpx, round(smm[1] / 25.4 * yd))
+        label = f"page {page_no}: " if args.pages > 1 else ""
+        log(f"{label}scanning {args.mode} {xd} dpi, {w}x{h} px ...")
+
+        tty = sys.stderr.isatty() and not args.quiet
+        shown = [0]
+
+        def progress(nbytes, nchunks):
+            if tty and nbytes - shown[0] >= 200_000:
+                shown[0] = nbytes
+                sys.stderr.write(f"\r  {nbytes / 1e6:6.1f} MB received")
+                sys.stderr.flush()
+        chunks, _ = sc.scan_page(xd, mode, comp, w, h, args.brightness, args.contrast, progress)
+        if tty:
+            sys.stderr.write(f"\r  {shown[0] / 1e6:6.1f} MB received\n")
+        return build_page(chunks, args.mode, w, xd)
+    finally:
+        sc.close()
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(prog="brscan", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="\n".join(__doc__.split("\n")[4:]))
+    ap.add_argument("output", nargs="?", type=output_format,
+                    help="output file (.pdf .jpg .png .tiff .heic); default scan-<time>.pdf")
+    ap.add_argument("-m", "--mode", choices=MODES, default="color")
+    ap.add_argument("-r", "--resolution", type=int, choices=RESOLUTIONS, default=300,
+                    help="dpi: 100 150 200 300 600 1200 (default 300)")
+    ap.add_argument("-s", "--size", choices=SIZES_MM, default="a4", help="scan area (default a4; full = whole glass)")
+    ap.add_argument("-n", "--pages", type=positive_int, default=1, help="number of flatbed pages to scan into one file")
+    ap.add_argument("-b", "--brightness", type=bounded_int, default=50, help="0-100 (default 50)")
+    ap.add_argument("-c", "--contrast", type=bounded_int, default=50, help="0-100 (default 50)")
+    ap.add_argument("--host", help="scanner host/IP; required unless BRSCAN_HOST or BRSCAN_IP is set")
+    ap.add_argument("--open", action="store_true", help="open the result when done")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--info", action="store_true", help="show scanner status and max scan area, then exit")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    return ap.parse_args(argv)
+
+
+def validate_args(args, environ=None):
+    """Resolve host configuration and recheck values for programmatic callers."""
+    if args.pages <= 0:
+        raise ScanError("page count must be positive")
+    if args.resolution not in RESOLUTIONS:
+        raise ScanError(f"unsupported resolution: {args.resolution}")
+    if not 0 <= args.brightness <= 100 or not 0 <= args.contrast <= 100:
+        raise ScanError("brightness and contrast must be between 0 and 100")
+    if args.output is not None:
+        try:
+            output_format(args.output)
+        except argparse.ArgumentTypeError as exc:
+            raise ScanError(str(exc)) from exc
+    hosts = host_candidates(args.host, environ)
+    args.host, args.fallback_hosts = hosts[0], tuple(hosts[1:])
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    try:
+        validate_args(args)
+        if args.info:
+            sc = Scanner(args.host, fallback_hosts=args.fallback_hosts)
+            try:
+                sc.connect()
+                xd, yd, wmm, wpx, hmm, hpx = sc.negotiate(args.resolution, MODES[args.mode][0])
+            finally:
+                sc.close()
+            print(f"scanner {args.host}: ready\n  {xd}x{yd} dpi, glass {wmm}x{hmm} mm = {wpx}x{hpx} px")
+            return 0
+        out = args.output or datetime.datetime.now().strftime("scan-%Y%m%d-%H%M%S.pdf")
+        output_format(out)
+        pages = []
+        for n in range(1, args.pages + 1):
+            if n > 1:
+                try:
+                    input(f"Place page {n} of {args.pages} on the glass and press Enter (Ctrl-C to stop) ")
+                except (KeyboardInterrupt, EOFError):
+                    log("\nstopping, keeping pages scanned so far")
+                    break
+            pages.append(scan_one(args, n))
+        files = save(pages, out)
+        for f in files:
+            print(f)
+        if args.open:
+            try:
+                opened = subprocess.run(["/usr/bin/open", *files],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except OSError as exc:
+                raise ScanError(f"could not open scan output: {exc}") from exc
+            if opened.returncode:
+                detail = opened.stderr.decode(errors="replace").strip() if opened.stderr else "unknown error"
+                raise ScanError(f"could not open scan output: {detail}")
+        return 0
+    except ScanError as e:
+        log(f"brscan: {e}")
+        return 1
+    except KeyboardInterrupt:
+        log("\ninterrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
